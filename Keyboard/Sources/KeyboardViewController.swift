@@ -11,7 +11,7 @@ import UIKit
 /// 这是 iOS 键盘扩展的唯一开关，没有别的权限可申请。
 final class KeyboardViewController: UIInputViewController {
 
-    private enum Mode { case gate, idle, tones, loading, result, error }
+    private enum Mode { case gate, idle, tones, loading, result, error, config }
 
     private var mode: Mode = .idle
     private var lastSource: Source = .clipboard
@@ -19,6 +19,8 @@ final class KeyboardViewController: UIInputViewController {
     private var analysis: Analysis?
     private var errorText: String = ""
     private var stageLabel = UILabel()
+    /// 「配置判断层」页正在编辑的配置（键盘本地通道，见 JevStore.keyboardLocal*）
+    private var pendingJudge = JevConfig()
 
     private enum Source { case clipboard, inputField }
 
@@ -86,7 +88,7 @@ final class KeyboardViewController: UIInputViewController {
     /// 结果直接丢掉（失败也无所谓，真分析时该走的路径照走）。
     private func prewarm() {
         guard hasFullAccess else { return }
-        let g = JevStore.loadConfig().generation
+        let g = JevStore.keyboardConfig().generation
         guard !g.key.isEmpty, !g.base.isEmpty else { return }
         let base = g.base.hasSuffix("/") ? String(g.base.dropLast()) : g.base
         guard let url = URL(string: base + "/models") else { return }
@@ -305,6 +307,7 @@ final class KeyboardViewController: UIInputViewController {
         case .loading: contentStack.addArrangedSubview(loadingView())
         case .result: contentStack.addArrangedSubview(resultView())
         case .error: contentStack.addArrangedSubview(errorView())
+        case .config: contentStack.addArrangedSubview(configView())
         }
     }
 
@@ -347,7 +350,7 @@ final class KeyboardViewController: UIInputViewController {
     // MARK: 待机视图
 
     private func idleView() -> UIView {
-        let cfg = JevStore.loadConfig()
+        let cfg = JevStore.keyboardConfig()
 
         let guide = KB.label(
             "长按对方消息 → 复制，再点下面的按钮",
@@ -383,6 +386,14 @@ final class KeyboardViewController: UIInputViewController {
         let vstack = UIStackView(arrangedSubviews: [guide, btnRow, tonesBtn])
         vstack.axis = .vertical
         vstack.spacing = 8
+        if cfg.judgeKey.isEmpty {
+            // 侧载没有 App Group 权限时，App 里配的判断层读不到，必须走键盘本地配置
+            let judgeBtn = KB.button("⚠️ 未配置判断层 · 点这里配置", icon: "gearshape",
+                                     font: .systemFont(ofSize: 13, weight: .semibold))
+            judgeBtn.heightAnchor.constraint(equalToConstant: 34).isActive = true
+            judgeBtn.addTarget(self, action: #selector(openConfig), for: .touchUpInside)
+            vstack.addArrangedSubview(judgeBtn)
+        }
         if !cfg.generation.key.isEmpty {
             // 配置正常（含内置中转兜底）时不占行
         } else {
@@ -401,7 +412,7 @@ final class KeyboardViewController: UIInputViewController {
     /// 话术选择：内置 + 自定义全列出来，点一下选中/取消，最多 3 个槽。
     /// 每次从共享配置重新读（App 那边改过也能立刻看到），选中即落盘，下一次分析就生效。
     private func tonesView() -> UIView {
-        let cfg = JevStore.loadConfig()
+        let cfg = JevStore.keyboardConfig()
         let names = orderedToneNames(custom: cfg.customTones)
         let active = cfg.activeSlots
 
@@ -452,7 +463,7 @@ final class KeyboardViewController: UIInputViewController {
 
     @objc private func toneChipTapped(_ sender: UIButton) {
         guard let name = sender.accessibilityIdentifier else { return }
-        var cfg = JevStore.loadConfig()
+        var cfg = JevStore.keyboardConfig()
         var slots = cfg.slots
         while slots.count < MAX_SLOTS { slots.append(NONE_LABEL) }
         if let i = slots.firstIndex(of: name) {
@@ -463,7 +474,8 @@ final class KeyboardViewController: UIInputViewController {
             slots[MAX_SLOTS - 1] = name                // 槽满了就顶掉最后一个
         }
         cfg.slots = Array(slots.prefix(MAX_SLOTS))
-        JevStore.saveConfig(cfg)                       // 立刻落盘：下一次分析就用新槽位
+        // 侧载无 App Group 权限时写共享容器会静默丢数据，键盘侧统一落本地配置
+        JevStore.saveKeyboardLocalConfig(cfg)          // 立刻落盘：下一次分析就用新槽位
         render()                                       // 重画刷新高亮
     }
 
@@ -707,11 +719,137 @@ final class KeyboardViewController: UIInputViewController {
     @objc private func regenerate() { run(message: lastMessage) }
     @objc private func backToIdle() { setMode(.idle) }
 
+    // MARK: 判断层配置（键盘本地直配，侧载无 App Group 权限时的唯一通道）
+
+    /// 进入配置页。编辑目标是键盘本地配置；初始值优先取共享配置里已有的判断层端点。
+    @objc private func openConfig() {
+        var cfg = JevStore.keyboardLocalConfig()
+        if cfg.judgeBase.isEmpty { cfg.judgeBase = JevStore.keyboardConfig().judgeBase }
+        if cfg.judgeModel.isEmpty { cfg.judgeModel = JevStore.keyboardConfig().judgeModel }
+        pendingJudge = cfg
+        setMode(.config)
+    }
+
+    /// 判断层预设：一键填地址 + 模型（与 App 里 JudgePreset.all 同一批值）
+    @objc private func judgePresetTapped(_ sender: UIButton) {
+        switch sender.accessibilityIdentifier {
+        case "typesafe":
+            pendingJudge.judgeBase = "https://api.typesafe.ai"
+            pendingJudge.judgeModel = "jev-latest"
+        case "openrouter":
+            pendingJudge.judgeBase = "https://openrouter.ai/api/alpha/decisions"
+            pendingJudge.judgeModel = "typesafe/jev-1.13"
+        case "vercel":
+            pendingJudge.judgeBase = "https://ai-gateway.vercel.sh/v1/evaluate"
+            pendingJudge.judgeModel = "typesafe-ai/jev"
+        default: break
+        }
+        render()
+    }
+
+    /// 键盘扩展内无法弹系统键盘输入，Key 统一走「复制 → 从剪贴板粘贴」。
+    @objc private func pasteJudgeKey() {
+        let text = UIPasteboard.general.string?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        guard !text.isEmpty else {
+            flashJudgeHint("剪贴板是空的：先在聊天里复制 API Key 再点这里", color: .systemOrange)
+            return
+        }
+        pendingJudge.judgeKey = text
+        render()
+    }
+
+    @objc private func saveJudgeConfig() {
+        JevStore.saveKeyboardLocalConfig(pendingJudge)
+        flashJudgeHint("已保存 ✓", color: KB.riskColor(0))
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { [weak self] in
+            self?.setMode(.idle)
+        }
+    }
+
+    /// 配置页底部反馈行（借用 flashTarget 机制，配置页自己接管）
+    private var judgeHint = UILabel()
+    private func flashJudgeHint(_ text: String, color: UIColor) {
+        judgeHint.textColor = color
+        judgeHint.text = text
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) { [weak self] in
+            guard let self else { return }
+            if self.mode == .config {
+                self.judgeHint.textColor = KB.secondaryText
+                self.judgeHint.text = self.configHintText()
+            }
+        }
+    }
+
+    private func configHintText() -> String {
+        let cfg = pendingJudge
+        let base = cfg.judgeBase.isEmpty ? "（未选）" : cfg.judgeBase
+        let model = cfg.judgeModel.isEmpty ? "（未选）" : cfg.judgeModel
+        return "地址 \(base)\n模型 \(model)\nKey \(JevStore.masked(cfg.judgeKey))"
+    }
+
+    /// 配置页：三个预设 + 剪贴板粘贴 Key + 保存。全部用系统按钮/标签，无 UITextField
+    /// （键盘扩展内无法弹系统键盘，录入只能走剪贴板 + 预设）。
+    private func configView() -> UIView {
+        let title = KB.label("配置判断层（键盘直配）", font: .systemFont(ofSize: 15, weight: .bold),
+                             color: KB.primaryText)
+        let sub = KB.label(
+            "侧载时 App 里配的判断层可能读不到，在这里直接配。\n先选预设，再把 API Key 复制到剪贴板后点下面的按钮。",
+            font: .systemFont(ofSize: 11), color: KB.secondaryText, lines: 0)
+
+        let presetRow = UIStackView()
+        presetRow.axis = .horizontal
+        presetRow.spacing = 6
+        presetRow.distribution = .fillEqually
+        let presets: [(String, String)] = [("typesafe", "TypeSafe"), ("openrouter", "OpenRouter"), ("vercel", "Vercel")]
+        for (id, name) in presets {
+            let b = KB.button(name, font: .systemFont(ofSize: 12, weight: .medium))
+            b.accessibilityIdentifier = id
+            b.heightAnchor.constraint(equalToConstant: 34).isActive = true
+            b.addTarget(self, action: #selector(judgePresetTapped(_:)), for: .touchUpInside)
+            presetRow.addArrangedSubview(b)
+        }
+
+        judgeHint = KB.label(configHintText(), font: .systemFont(ofSize: 12), color: KB.secondaryText, lines: 0)
+        judgeHint.setContentHuggingPriority(.required, for: .vertical)
+
+        let pasteBtn = KB.button("从剪贴板粘贴 API Key", icon: "doc.on.clipboard",
+                                 font: .systemFont(ofSize: 13, weight: .semibold))
+        pasteBtn.heightAnchor.constraint(equalToConstant: 38).isActive = true
+        pasteBtn.addTarget(self, action: #selector(pasteJudgeKey), for: .touchUpInside)
+
+        let saveBtn = KB.button("保存并返回", icon: "checkmark", primary: true,
+                                font: .systemFont(ofSize: 14, weight: .semibold))
+        saveBtn.heightAnchor.constraint(equalToConstant: 40).isActive = true
+        saveBtn.addTarget(self, action: #selector(saveJudgeConfig), for: .touchUpInside)
+
+        let back = KB.button("返回", icon: "chevron.left", font: .systemFont(ofSize: 13))
+        back.heightAnchor.constraint(equalToConstant: 34).isActive = true
+        back.addTarget(self, action: #selector(backToIdle), for: .touchUpInside)
+
+        let card = KB.cardView()
+        let vstack = UIStackView(arrangedSubviews: [title, sub, presetRow, judgeHint, pasteBtn, saveBtn, back])
+        vstack.axis = .vertical
+        vstack.spacing = 7
+        vstack.isLayoutMarginsRelativeArrangement = true
+        vstack.directionalLayoutMargins = NSDirectionalEdgeInsets(top: 10, leading: 10, bottom: 10, trailing: 10)
+        card.addSubview(vstack)
+        vstack.translatesAutoresizingMaskIntoConstraints = false
+        NSLayoutConstraint.activate([
+            vstack.topAnchor.constraint(equalTo: card.topAnchor),
+            vstack.bottomAnchor.constraint(equalTo: card.bottomAnchor),
+            vstack.leadingAnchor.constraint(equalTo: card.leadingAnchor),
+            vstack.trailingAnchor.constraint(equalTo: card.trailingAnchor),
+        ])
+        fitBlocks = [card]
+        return card
+    }
+
     private func run(message: String) {
         lastMessage = message
         setMode(.loading)
         stageLabel.text = "判断中…"
-        let pipeline = JevPipeline(cfg: JevStore.loadConfig())
+        let pipeline = JevPipeline(cfg: JevStore.keyboardConfig())
 
         Task { @MainActor [weak self] in
             let analysis = await pipeline.analyze(
