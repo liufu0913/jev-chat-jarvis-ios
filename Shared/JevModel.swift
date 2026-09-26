@@ -200,6 +200,38 @@ enum JevStore {
         }
     }
 
+    // MARK: - 键盘本地配置通道
+    //
+    // 侧载（AltStore/Sideloadly 免费账号）签名的 App 经常没有 App Group 权限：
+    // `UserDefaults(suiteName:)` 会静默退化，App 与键盘各自读写自己私有的容器，
+    // 键盘永远读不到 App 里配的模型/Key。这里给键盘一条独立通道——键盘自己的
+    // 私有 UserDefaults + 键盘上的「配置判断层」页直接录入。
+    // App Group 正常时键盘仍优先读共享配置；不通时自动回退到这份本地配置。
+    static var keyboardLocal: UserDefaults { .standard }
+    private static let localConfigKey = "jev.localconfig.v1"
+
+    static func keyboardLocalConfig() -> JevConfig {
+        guard let data = keyboardLocal.data(forKey: localConfigKey),
+              let cfg = try? JSONDecoder().decode(JevConfig.self, from: data) else {
+            return JevConfig()
+        }
+        return cfg
+    }
+
+    static func saveKeyboardLocalConfig(_ cfg: JevConfig) {
+        if let data = try? JSONEncoder().encode(cfg) {
+            keyboardLocal.set(data, forKey: localConfigKey)
+        }
+    }
+
+    /// 键盘侧实际生效的配置：App Group 共享配置有内容 → 用共享那份；
+    /// 否则（侧载无 App Group 权限时）用键盘本地配置。
+    static func keyboardConfig() -> JevConfig {
+        let shared = loadConfig()
+        let hasShared = !shared.judgeKey.isEmpty || !shared.genKey.isEmpty
+        return hasShared ? shared : keyboardLocalConfig()
+    }
+
     /// 密钥展示用掩码
     static func masked(_ key: String) -> String {
         guard !key.isEmpty else { return "（未配置）" }
